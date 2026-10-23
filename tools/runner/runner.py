@@ -39,6 +39,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -51,13 +52,34 @@ def run_cmd(cmd, timeout, cwd=None, env=None):
     start = time.monotonic()
     out_tail = ""
     try:
-        p = subprocess.run(
+        with subprocess.Popen(
             cmd if isinstance(cmd, list) else ["/bin/sh", "-c", cmd],
             cwd=cwd, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-        code, out = p.returncode, p.stdout.decode("utf-8", "replace")
+            # Run POSIX steps in their own group so ordinary descendants stop.
+            start_new_session=(os.name == "posix"),
+        ) as p:
+            try:
+                output, _ = p.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                if os.name == "posix":
+                    try:
+                        # The leader may have exited but its group can survive.
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    p.kill()
+                try:
+                    output, _ = p.communicate(timeout=1)
+                except subprocess.TimeoutExpired as drain:
+                    # Detached children may retain stdout: bound the drain.
+                    output = drain.output or exc.output or b""
+                    p.stdout.close()
+                    p.wait()
+                exc.output = output
+                raise
+            code, out = p.returncode, output.decode("utf-8", "replace")
     except subprocess.TimeoutExpired as exc:
         # communicate() has already collected output before the deadline. Keep it
         # so a slow build/test does not lose its last useful diagnostic.

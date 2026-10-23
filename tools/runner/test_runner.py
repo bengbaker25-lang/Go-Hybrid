@@ -5,9 +5,12 @@ import io
 import json
 import os
 import pathlib
+import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -288,6 +291,67 @@ class RunnerOutputTests(unittest.TestCase):
         self.assertEqual(summary['steps'][0]['exit'], 124)
         self.assertIn('compiler-context', summary['steps'][0]['out_tail'])
         self.assertIn('<<TIMEOUT', summary['steps'][0]['out_tail'])
+
+
+@unittest.skipUnless(os.name == 'posix', 'requires POSIX process groups')
+class ProcessTreeTimeoutTests(unittest.TestCase):
+    def test_timeout_stops_descendants_for_shell_and_argv_commands(self):
+        for shell in (False, True):
+            with self.subTest(shell=shell), tempfile.TemporaryDirectory() as directory:
+                marker = pathlib.Path(directory) / 'child-finished'
+                child = ('import pathlib,time; print("child-ready", flush=True); '
+                         'time.sleep(2); '
+                         f'pathlib.Path({str(marker)!r}).touch()')
+                parent = ('import subprocess,sys,time; '
+                          f'subprocess.Popen([sys.executable, "-c", {child!r}]); '
+                          'time.sleep(5)')
+                argv = [sys.executable, '-c', parent]
+                command = shlex.join(argv) if shell else argv
+                started = time.monotonic()
+                code, _, tail = runner.run_cmd(command, 0.5)
+                elapsed = time.monotonic() - started
+                time.sleep(2)
+                self.assertEqual(code, 124)
+                self.assertIn('child-ready', tail)
+                self.assertIn('<<TIMEOUT after 0.5s>>', tail)
+                self.assertFalse(marker.exists(), 'timed-out child kept running')
+                self.assertLess(elapsed, 1.5, 'descendant held the output pipe open')
+
+    def test_timeout_kills_child_even_after_group_leader_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = pathlib.Path(directory) / 'child-finished'
+            child = ('import pathlib,time; print("child-ready", flush=True); '
+                     f'time.sleep(2); pathlib.Path({str(marker)!r}).touch()')
+            parent = ('import subprocess,sys; '
+                      f'subprocess.Popen([sys.executable, "-c", {child!r}])')
+            code, _, tail = runner.run_cmd([sys.executable, '-c', parent], 0.5)
+            time.sleep(2)
+            self.assertEqual(code, 124)
+            self.assertIn('child-ready', tail)
+            self.assertFalse(marker.exists(), 'child survived after leader exit')
+
+    def test_detached_pipe_holder_does_not_make_cleanup_unbounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = pathlib.Path(directory) / 'detached.pid'
+            child = ('import os,pathlib,time; '
+                     f'pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); '
+                     'time.sleep(5)')
+            parent = ('import subprocess,sys,time; '
+                      f'subprocess.Popen([sys.executable, "-c", {child!r}], '
+                      'start_new_session=True); time.sleep(5)')
+            try:
+                started = time.monotonic()
+                code, _, tail = runner.run_cmd([sys.executable, '-c', parent], 0.5)
+                self.assertEqual(code, 124)
+                self.assertIn('<<TIMEOUT', tail)
+                self.assertLess(time.monotonic() - started, 2.5)
+                self.assertTrue(pid_file.exists())
+            finally:
+                if pid_file.exists():
+                    try:
+                        os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 class WorktreeShaTests(unittest.TestCase):
